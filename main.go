@@ -89,16 +89,22 @@ func cmdUI(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	ui.Status("shaking the swear jar...")
-	report, err := buildReport(ctx, opts)
+	adapters, err := agent.Select(opts.agents, len(opts.paths) > 0)
 	if err != nil {
 		return err
 	}
 	if !ui.IsTTY() {
+		report, err := scanAdapters(ctx, adapters, opts)
+		if err != nil {
+			return err
+		}
 		render.Report(os.Stdout, report, false)
 		return nil
 	}
-	return tui.Run(report)
+	return tui.RunScan(ctx, adapters, agent.Options{
+		Since: opts.since,
+		Paths: opts.paths,
+	}, opts.scope)
 }
 
 func buildReport(ctx context.Context, opts options) (analytics.Report, error) {
@@ -106,6 +112,10 @@ func buildReport(ctx context.Context, opts options) (analytics.Report, error) {
 	if err != nil {
 		return analytics.Report{}, err
 	}
+	return scanAdapters(ctx, adapters, opts)
+}
+
+func scanAdapters(ctx context.Context, adapters []agent.Adapter, opts options) (analytics.Report, error) {
 	return analytics.Scan(ctx, adapters, agent.Options{
 		Since: opts.since,
 		Paths: opts.paths,

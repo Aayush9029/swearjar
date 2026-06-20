@@ -40,10 +40,10 @@ func Report(w io.Writer, report analytics.Report, color bool) {
 		fmt.Fprintln(w)
 		fmt.Fprintf(w, "  %stop words%s\n", c.bold, c.reset)
 		for _, row := range report.Words {
-			fmt.Fprintf(w, "    %s%-12s%s %s%5d%s  %s%5.1f%% · %s%s\n",
+			fmt.Fprintf(w, "    %s%-12s%s %s%5d%s  %s%5.1f%%%s\n",
 				c.yellow, row.Group, c.reset,
 				c.bold, row.Count, c.reset,
-				c.dim, row.Share, row.Source, c.reset)
+				c.dim, row.Share, c.reset)
 		}
 	} else {
 		fmt.Fprintln(w)

@@ -3,21 +3,47 @@ package analytics
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Aayush9029/swearjar/internal/agent"
 	"github.com/Aayush9029/swearjar/internal/detector"
-	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/duckdb/duckdb-go/v2"
+	"golang.org/x/sync/errgroup"
 )
 
 type Store struct {
-	db          *sql.DB
-	tx          *sql.Tx
-	insertMsg   *sql.Stmt
-	insertMatch *sql.Stmt
-	nextID      int64
-	startedAt   time.Time
+	db              *sql.DB
+	nextID          int64
+	startedAt       time.Time
+	pendingMessages []messageRow
+	pendingMatches  []matchRow
+}
+
+const flushRows = 4096
+
+type messageRow struct {
+	ID        int64
+	Agent     string
+	Session   string
+	Project   string
+	Timestamp string
+	Chars     int64
+}
+
+type matchRow struct {
+	MessageID int64
+	Agent     string
+	Session   string
+	Project   string
+	Timestamp string
+	Word      string
+	Group     string
 }
 
 func New(ctx context.Context) (*Store, error) {
@@ -52,52 +78,46 @@ func (s *Store) init(ctx context.Context) error {
 			project VARCHAR,
 			ts VARCHAR,
 			word VARCHAR,
-			group_name VARCHAR,
-			source VARCHAR
+			group_name VARCHAR
 		)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
 			return err
 		}
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	insertMsg, err := tx.PrepareContext(ctx, `INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	insertMatch, err := tx.PrepareContext(ctx, `INSERT INTO matches VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		_ = insertMsg.Close()
-		_ = tx.Rollback()
-		return err
-	}
-	s.tx = tx
-	s.insertMsg = insertMsg
-	s.insertMatch = insertMatch
 	return nil
 }
 
 func (s *Store) Insert(ctx context.Context, msg agent.Message, result detector.Result) error {
 	s.nextID++
 	id := s.nextID
-	if _, err := s.insertMsg.ExecContext(ctx, id, msg.Agent, msg.Session, msg.Project, msg.Timestamp, len(msg.Text)); err != nil {
-		return err
-	}
+	s.pendingMessages = append(s.pendingMessages, messageRow{
+		ID:        id,
+		Agent:     msg.Agent,
+		Session:   msg.Session,
+		Project:   msg.Project,
+		Timestamp: msg.Timestamp,
+		Chars:     int64(len(msg.Text)),
+	})
 	for _, match := range result.Matches {
-		if _, err := s.insertMatch.ExecContext(ctx, id, msg.Agent, msg.Session, msg.Project, msg.Timestamp, match.Word, match.Group, match.Source); err != nil {
-			return err
-		}
+		s.pendingMatches = append(s.pendingMatches, matchRow{
+			MessageID: id,
+			Agent:     msg.Agent,
+			Session:   msg.Session,
+			Project:   msg.Project,
+			Timestamp: msg.Timestamp,
+			Word:      match.Word,
+			Group:     match.Group,
+		})
+	}
+	if len(s.pendingMessages)+len(s.pendingMatches) >= flushRows {
+		return s.Flush(ctx)
 	}
 	return nil
 }
 
 func (s *Store) Report(ctx context.Context, scope string) (Report, error) {
-	if err := s.flush(); err != nil {
+	if err := s.Flush(ctx); err != nil {
 		return Report{}, err
 	}
 
@@ -143,7 +163,7 @@ func (s *Store) Report(ctx context.Context, scope string) (Report, error) {
 }
 
 func (s *Store) Close() error {
-	err := s.flush()
+	err := s.Flush(context.Background())
 	if s.db != nil {
 		if closeErr := s.db.Close(); err == nil {
 			err = closeErr
@@ -152,21 +172,77 @@ func (s *Store) Close() error {
 	return err
 }
 
-func (s *Store) flush() error {
-	if s.tx == nil {
+func (s *Store) Flush(ctx context.Context) error {
+	if len(s.pendingMessages) == 0 && len(s.pendingMatches) == 0 {
 		return nil
 	}
-	if s.insertMsg != nil {
-		_ = s.insertMsg.Close()
+	if err := s.appendRows(ctx, s.pendingMessages, s.pendingMatches); err != nil {
+		return err
 	}
-	if s.insertMatch != nil {
-		_ = s.insertMatch.Close()
+	s.pendingMessages = s.pendingMessages[:0]
+	s.pendingMatches = s.pendingMatches[:0]
+	return nil
+}
+
+func (s *Store) appendRows(ctx context.Context, messages []messageRow, matches []matchRow) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
 	}
-	err := s.tx.Commit()
-	s.tx = nil
-	s.insertMsg = nil
-	s.insertMatch = nil
-	return err
+	defer conn.Close()
+
+	return conn.Raw(func(raw any) error {
+		driverConn, ok := raw.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("duckdb raw connection has unexpected type %T", raw)
+		}
+		if err := appendMessages(driverConn, messages); err != nil {
+			return err
+		}
+		return appendMatches(driverConn, matches)
+	})
+}
+
+func appendMessages(conn driver.Conn, rows []messageRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	appender, err := duckdb.NewAppenderFromConn(conn, "", "messages")
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := appender.AppendRow(row.ID, row.Agent, row.Session, row.Project, row.Timestamp, row.Chars); err != nil {
+			_ = appender.Close()
+			return err
+		}
+	}
+	if err := appender.Flush(); err != nil {
+		_ = appender.Close()
+		return err
+	}
+	return appender.Close()
+}
+
+func appendMatches(conn driver.Conn, rows []matchRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	appender, err := duckdb.NewAppenderFromConn(conn, "", "matches")
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := appender.AppendRow(row.MessageID, row.Agent, row.Session, row.Project, row.Timestamp, row.Word, row.Group); err != nil {
+			_ = appender.Close()
+			return err
+		}
+	}
+	if err := appender.Flush(); err != nil {
+		_ = appender.Close()
+		return err
+	}
+	return appender.Close()
 }
 
 func queryAgents(ctx context.Context, db *sql.DB) ([]AgentRow, error) {
@@ -209,7 +285,7 @@ func queryAgents(ctx context.Context, db *sql.DB) ([]AgentRow, error) {
 
 func queryWords(ctx context.Context, db *sql.DB, total int64) ([]WordRow, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT group_name, any_value(source), count(*) AS swears
+		SELECT group_name, count(*) AS swears
 		FROM matches
 		GROUP BY group_name
 		ORDER BY swears DESC, group_name ASC
@@ -223,7 +299,7 @@ func queryWords(ctx context.Context, db *sql.DB, total int64) ([]WordRow, error)
 	var out []WordRow
 	for rows.Next() {
 		var row WordRow
-		if err := rows.Scan(&row.Group, &row.Source, &row.Count); err != nil {
+		if err := rows.Scan(&row.Group, &row.Count); err != nil {
 			return nil, err
 		}
 		row.Share = percent(row.Count, total)
@@ -300,21 +376,152 @@ func percent(num, denom int64) float64 {
 }
 
 func Scan(ctx context.Context, adapters []agent.Adapter, opts agent.Options, scope string) (Report, error) {
+	return ScanWithProgress(ctx, adapters, opts, scope, nil)
+}
+
+func ScanWithProgress(ctx context.Context, adapters []agent.Adapter, opts agent.Options, scope string, progress ProgressFunc) (Report, error) {
 	store, err := New(ctx)
 	if err != nil {
 		return Report{}, err
 	}
 	defer store.Close()
 
-	d := detector.New()
-	for _, adapter := range adapters {
-		err := adapter.VisitMessages(ctx, opts, func(msg agent.Message) error {
-			result := d.Detect(msg.Text)
-			return store.Insert(ctx, msg, result)
-		})
-		if err != nil {
-			return Report{}, fmt.Errorf("%s: %w", adapter.Name(), err)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var progressMu sync.Mutex
+	emit := func(p Progress) {
+		if progress == nil {
+			return
 		}
+		progressMu.Lock()
+		progress(p)
+		progressMu.Unlock()
+	}
+
+	messages := make(chan agent.Message, 2048)
+	detected := make(chan detectedMessage, 2048)
+	adapterErr := make(chan error, 1)
+	workerErr := make(chan error, 1)
+
+	adapterGroup, adapterCtx := errgroup.WithContext(ctx)
+	var adaptersDone atomic.Int64
+	for i, adapter := range adapters {
+		index := i + 1
+		adapter := adapter
+		adapterGroup.Go(func() error {
+			emit(Progress{Kind: ProgressAdapterStart, Agent: adapter.Name(), AdapterIndex: index, AdapterTotal: len(adapters), AdaptersDone: adaptersDone.Load()})
+			err := adapter.VisitMessages(adapterCtx, opts, func(msg agent.Message) error {
+				select {
+				case <-adapterCtx.Done():
+					return adapterCtx.Err()
+				case messages <- msg:
+					return nil
+				}
+			})
+			if err != nil {
+				return fmt.Errorf("%s: %w", adapter.Name(), err)
+			}
+			done := adaptersDone.Add(1)
+			emit(Progress{Kind: ProgressAdapterDone, Agent: adapter.Name(), AdapterIndex: index, AdapterTotal: len(adapters), AdaptersDone: done})
+			return nil
+		})
+	}
+	go func() {
+		adapterErr <- adapterGroup.Wait()
+		close(messages)
+	}()
+
+	workerGroup, workerCtx := errgroup.WithContext(ctx)
+	workerCount := max(2, min(runtime.GOMAXPROCS(0), 8))
+	for range workerCount {
+		workerGroup.Go(func() error {
+			d := detector.New()
+			for msg := range messages {
+				result := d.Detect(msg.Text)
+				select {
+				case <-workerCtx.Done():
+					return workerCtx.Err()
+				case detected <- detectedMessage{Message: msg, Result: result}:
+				}
+			}
+			return nil
+		})
+	}
+	go func() {
+		workerErr <- workerGroup.Wait()
+		close(detected)
+	}()
+
+	stats := newProgressStats()
+	var insertErr error
+	for item := range detected {
+		if insertErr != nil {
+			continue
+		}
+		if err := store.Insert(ctx, item.Message, item.Result); err != nil {
+			insertErr = err
+			cancel()
+			continue
+		}
+		emit(stats.add(item.Message, item.Result, adaptersDone.Load(), len(adapters)))
+	}
+
+	if err := <-workerErr; err != nil && !errors.Is(err, context.Canceled) {
+		return Report{}, err
+	}
+	if err := <-adapterErr; err != nil && !errors.Is(err, context.Canceled) {
+		return Report{}, err
+	}
+	if insertErr != nil {
+		return Report{}, insertErr
 	}
 	return store.Report(ctx, scope)
+}
+
+type detectedMessage struct {
+	Message agent.Message
+	Result  detector.Result
+}
+
+type progressStats struct {
+	Messages int64
+	Swears   int64
+	Agents   map[string]*agentProgress
+	LastWord string
+}
+
+type agentProgress struct {
+	Messages int64
+	Swears   int64
+}
+
+func newProgressStats() *progressStats {
+	return &progressStats{Agents: map[string]*agentProgress{}}
+}
+
+func (s *progressStats) add(msg agent.Message, result detector.Result, adaptersDone int64, adapterTotal int) Progress {
+	s.Messages++
+	s.Swears += int64(result.Count)
+	agentStats := s.Agents[msg.Agent]
+	if agentStats == nil {
+		agentStats = &agentProgress{}
+		s.Agents[msg.Agent] = agentStats
+	}
+	agentStats.Messages++
+	agentStats.Swears += int64(result.Count)
+	if len(result.Matches) > 0 {
+		s.LastWord = result.Matches[0].Group
+	}
+	return Progress{
+		Kind:          ProgressMessage,
+		Agent:         msg.Agent,
+		AdapterTotal:  adapterTotal,
+		AdaptersDone:  adaptersDone,
+		Messages:      s.Messages,
+		Swears:        s.Swears,
+		AgentMessages: agentStats.Messages,
+		AgentSwears:   agentStats.Swears,
+		LastWord:      s.LastWord,
+	}
 }

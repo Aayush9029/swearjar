@@ -4,12 +4,10 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/Aayush9029/swearjar/internal/analytics"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/sahilm/fuzzy"
 )
 
 type Model struct {
@@ -18,8 +16,6 @@ type Model struct {
 	cursor int
 	width  int
 	height int
-	filter string
-	input  bool
 }
 
 var (
@@ -47,30 +43,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case tea.KeyMsg:
-		if m.input {
-			return m.handleFilterKey(msg), nil
-		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
-		case "/":
-			if m.tab != 0 {
-				m.input = true
-			}
 		case "tab", "right", "l":
 			m.tab = (m.tab + 1) % 4
-			m.cursor, m.filter, m.input = 0, "", false
+			m.cursor = 0
 		case "shift+tab", "left", "h":
 			m.tab = (m.tab + 3) % 4
-			m.cursor, m.filter, m.input = 0, "", false
+			m.cursor = 0
 		case "1":
-			m.tab, m.cursor, m.filter, m.input = 0, 0, "", false
+			m.tab, m.cursor = 0, 0
 		case "2":
-			m.tab, m.cursor, m.filter, m.input = 1, 0, "", false
+			m.tab, m.cursor = 1, 0
 		case "3":
-			m.tab, m.cursor, m.filter, m.input = 2, 0, "", false
+			m.tab, m.cursor = 2, 0
 		case "4":
-			m.tab, m.cursor, m.filter, m.input = 3, 0, "", false
+			m.tab, m.cursor = 3, 0
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -82,37 +71,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
-}
-
-func (m Model) handleFilterKey(msg tea.KeyMsg) Model {
-	if msg.String() == "backspace" {
-		if m.filter != "" {
-			_, size := utf8.DecodeLastRuneInString(m.filter)
-			m.filter = m.filter[:len(m.filter)-size]
-			m.cursor = 0
-		}
-		return m
-	}
-	switch msg.Type {
-	case tea.KeyEsc, tea.KeyEnter:
-		m.input = false
-		return m
-	case tea.KeyBackspace:
-		if m.filter != "" {
-			_, size := utf8.DecodeLastRuneInString(m.filter)
-			m.filter = m.filter[:len(m.filter)-size]
-			m.cursor = 0
-		}
-		return m
-	case tea.KeyCtrlC:
-		m.input = false
-		return m
-	}
-	if msg.Type == tea.KeyRunes {
-		m.filter += msg.String()
-		m.cursor = 0
-	}
-	return m
 }
 
 func (m Model) View() string {
@@ -130,7 +88,7 @@ func (m Model) View() string {
 		b.WriteString(m.sessions())
 	}
 	b.WriteString("\n\n")
-	b.WriteString(dim.Render("tab switch · / fuzzy filter · j/k move · 1-4 jump · q quit"))
+	b.WriteString(dim.Render("tab switch · j/k move · 1-4 jump · q quit"))
 	return b.String()
 }
 
@@ -148,17 +106,7 @@ func (m Model) headerView() string {
 	if scope == "" {
 		scope = "all local history"
 	}
-	filter := ""
-	if m.tab != 0 && (m.input || m.filter != "") {
-		prompt := "/"
-		if m.input {
-			prompt = selected.Render("/")
-		} else {
-			prompt = dim.Render("/")
-		}
-		filter = dim.Render("  filter ") + prompt + m.filter
-	}
-	return title.Render("swearjar") + dim.Render("  "+scope+"  ") + strings.Join(parts, dim.Render(" / ")) + filter
+	return title.Render("swearjar") + dim.Render("  "+scope+"  ") + strings.Join(parts, dim.Render(" / "))
 }
 
 func (m Model) overview() string {
@@ -182,7 +130,7 @@ func (m Model) overview() string {
 		b.WriteString(header.Render("top words"))
 		b.WriteString("\n")
 		for _, row := range m.report.Words[:min(len(m.report.Words), 8)] {
-			b.WriteString(fmt.Sprintf("  %-12s %5d  %s\n", selected.Render(row.Group), row.Count, dim.Render(row.Source)))
+			b.WriteString(fmt.Sprintf("  %-12s %5d  %s\n", selected.Render(row.Group), row.Count, dim.Render(fmt.Sprintf("%.1f%%", row.Share))))
 		}
 	} else if m.report.Totals.Messages > 0 {
 		b.WriteString("\n")
@@ -195,7 +143,7 @@ func (m Model) overview() string {
 }
 
 func (m Model) agents() string {
-	rows := m.filteredAgents()
+	rows := m.report.Agents
 	if len(rows) == 0 {
 		return dim.Render("no agents found")
 	}
@@ -222,7 +170,7 @@ func (m Model) agents() string {
 }
 
 func (m Model) words() string {
-	rows := m.filteredWords()
+	rows := m.report.Words
 	if len(rows) == 0 {
 		return dim.Render("no swears found")
 	}
@@ -240,7 +188,7 @@ func (m Model) words() string {
 			prefix,
 			selected.Render(row.Group),
 			row.Count,
-			dim.Render(fmt.Sprintf("%.1f%% · %s", row.Share, row.Source)),
+			dim.Render(fmt.Sprintf("%.1f%%", row.Share)),
 			tuiBar(row.Count, max, 18),
 			dim.Render(variants)))
 	}
@@ -248,7 +196,7 @@ func (m Model) words() string {
 }
 
 func (m Model) sessions() string {
-	rows := m.filteredSessions()
+	rows := m.report.Sessions
 	if len(rows) == 0 {
 		return dim.Render("no sessions found")
 	}
@@ -278,62 +226,14 @@ func (m Model) sessions() string {
 func (m Model) currentMax() int {
 	switch m.tab {
 	case 1:
-		return len(m.filteredAgents())
+		return len(m.report.Agents)
 	case 2:
-		return len(m.filteredWords())
+		return len(m.report.Words)
 	case 3:
-		return len(m.filteredSessions())
+		return len(m.report.Sessions)
 	default:
 		return 0
 	}
-}
-
-func (m Model) filteredAgents() []analytics.AgentRow {
-	if strings.TrimSpace(m.filter) == "" {
-		return m.report.Agents
-	}
-	names := make([]string, len(m.report.Agents))
-	for i, row := range m.report.Agents {
-		names[i] = row.Agent
-	}
-	matches := fuzzy.Find(m.filter, names)
-	out := make([]analytics.AgentRow, 0, len(matches))
-	for _, match := range matches {
-		out = append(out, m.report.Agents[match.Index])
-	}
-	return out
-}
-
-func (m Model) filteredWords() []analytics.WordRow {
-	if strings.TrimSpace(m.filter) == "" {
-		return m.report.Words
-	}
-	names := make([]string, len(m.report.Words))
-	for i, row := range m.report.Words {
-		names[i] = row.Group + " " + row.Source
-	}
-	matches := fuzzy.Find(m.filter, names)
-	out := make([]analytics.WordRow, 0, len(matches))
-	for _, match := range matches {
-		out = append(out, m.report.Words[match.Index])
-	}
-	return out
-}
-
-func (m Model) filteredSessions() []analytics.SessionRow {
-	if strings.TrimSpace(m.filter) == "" {
-		return m.report.Sessions
-	}
-	names := make([]string, len(m.report.Sessions))
-	for i, row := range m.report.Sessions {
-		names[i] = row.Agent + " " + row.Session + " " + row.Project
-	}
-	matches := fuzzy.Find(m.filter, names)
-	out := make([]analytics.SessionRow, 0, len(matches))
-	for _, match := range matches {
-		out = append(out, m.report.Sessions[match.Index])
-	}
-	return out
 }
 
 func agentStyle(agent string) lipgloss.Style {

@@ -1,17 +1,18 @@
 package detector
 
 import (
+	"sort"
 	"strings"
 	"unicode"
 
 	goaway "github.com/TwiN/go-away"
+	"github.com/agnivade/levenshtein"
 )
 
 type Match struct {
-	Word   string `json:"word"`
-	Group  string `json:"group"`
-	Source string `json:"source"`
-	Index  int    `json:"index"`
+	Word  string `json:"word"`
+	Group string `json:"group"`
+	Index int    `json:"index"`
 }
 
 type Result struct {
@@ -20,112 +21,309 @@ type Result struct {
 }
 
 type Detector struct {
-	engine *goaway.ProfanityDetector
+	words             []string
+	exact             map[string]bool
+	falseNegatives    []string
+	falsePositiveList []string
 }
 
 func New() *Detector {
-	return &Detector{engine: goaway.NewProfanityDetector()}
+	words := unique(append(goaway.DefaultFalseNegatives, goaway.DefaultProfanities...))
+	sort.Slice(words, func(i, j int) bool {
+		return len(words[i]) > len(words[j])
+	})
+	exact := make(map[string]bool, len(words))
+	for _, word := range words {
+		exact[word] = true
+	}
+	return &Detector{
+		words:             words,
+		exact:             exact,
+		falseNegatives:    goaway.DefaultFalseNegatives,
+		falsePositiveList: goaway.DefaultFalsePositives,
+	}
 }
 
 func (d *Detector) Detect(text string) Result {
 	if strings.TrimSpace(text) == "" {
 		return Result{}
 	}
-	censored := d.engine.Censor(text)
-	if censored == text && !d.engine.IsProfane(text) {
-		return Result{}
-	}
 
-	ranges := profanityRanges([]rune(censored))
-	matches := make([]Match, 0, len(ranges))
-	original := []rune(text)
-	for _, r := range ranges {
-		if r.start < 0 || r.start >= len(original) {
+	var matches []Match
+	for _, token := range tokens(text) {
+		normalized := normalize(token.text)
+		if normalized == "" {
 			continue
 		}
-		end := min(r.end, len(original))
-		snippet := string(original[r.start:end])
-		word := d.engine.ExtractProfanity(snippet)
-		if word == "" {
-			from := max(0, r.start-3)
-			to := min(len(original), r.end+3)
-			word = d.engine.ExtractProfanity(string(original[from:to]))
+		for _, word := range d.matchToken(normalized) {
+			matches = append(matches, Match{
+				Word:  word,
+				Group: word,
+				Index: token.start,
+			})
 		}
-		if word == "" {
-			word = fallbackWord(snippet)
-		}
-		if word == "" {
-			continue
-		}
-		matches = append(matches, Match{
-			Word:   word,
-			Group:  word,
-			Source: "go-away",
-			Index:  r.start,
-		})
 	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].Index < matches[j].Index
+	})
 	return Result{Count: len(matches), Matches: matches}
 }
 
-type runeRange struct {
+func (d *Detector) matchToken(token string) []string {
+	if token == "" {
+		return nil
+	}
+
+	if d.exact[token] {
+		return []string{token}
+	}
+
+	for _, word := range d.falseNegatives {
+		if strings.Contains(token, word) {
+			return []string{word}
+		}
+	}
+
+	candidate, hadFalsePositive := d.withoutFalsePositives(token)
+	if candidate == "" {
+		return nil
+	}
+	if d.exact[candidate] {
+		return []string{candidate}
+	}
+	for _, word := range d.words {
+		if d.matchesCompound(candidate, word) {
+			return []string{word}
+		}
+	}
+	if hadFalsePositive {
+		return nil
+	}
+
+	word, ok := d.fuzzyMatch(candidate)
+	if !ok {
+		return nil
+	}
+	return []string{word}
+}
+
+func (d *Detector) withoutFalsePositives(token string) (string, bool) {
+	changed := false
+	for _, word := range d.falsePositiveList {
+		next := strings.ReplaceAll(token, word, "")
+		if next != token {
+			changed = true
+			token = next
+		}
+	}
+	return token, changed
+}
+
+func (d *Detector) matchesCompound(token, word string) bool {
+	if len(word) < 4 || len(token) <= len(word) {
+		return false
+	}
+	if !strings.Contains(token, word) {
+		return false
+	}
+	prefix := strings.HasPrefix(token, word)
+	suffix := strings.HasSuffix(token, word)
+	if !prefix && !suffix {
+		return false
+	}
+	return len(token)-len(word) <= 6
+}
+
+func (d *Detector) fuzzyMatch(token string) (string, bool) {
+	if len(token) < 4 {
+		return "", false
+	}
+
+	bestWord := ""
+	bestDistance := 99
+	for _, word := range d.words {
+		if len(word) < 4 || abs(len(token)-len(word)) > 2 || token[0] != word[0] {
+			continue
+		}
+		distance := levenshtein.ComputeDistance(token, word)
+		if !fuzzyOK(token, word, distance) {
+			continue
+		}
+		if distance < bestDistance {
+			bestWord = word
+			bestDistance = distance
+		}
+	}
+	return bestWord, bestWord != ""
+}
+
+func fuzzyOK(token, word string, distance int) bool {
+	if distance <= 1 {
+		return true
+	}
+	if len(token) == len(word) && adjacentTranspose(token, word) {
+		return true
+	}
+	return len(word) >= 7 && distance <= 2
+}
+
+func adjacentTranspose(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	first := -1
+	second := -1
+	for i := range a {
+		if a[i] == b[i] {
+			continue
+		}
+		if first == -1 {
+			first = i
+			continue
+		}
+		if second == -1 {
+			second = i
+			continue
+		}
+		return false
+	}
+	return first >= 0 && second == first+1 && a[first] == b[second] && a[second] == b[first]
+}
+
+type token struct {
+	text  string
 	start int
-	end   int
 }
 
-func profanityRanges(censored []rune) []runeRange {
-	var runs []runeRange
-	for i := 0; i < len(censored); {
-		if censored[i] != '*' {
-			i++
-			continue
-		}
-		start := i
-		for i < len(censored) && censored[i] == '*' {
-			i++
-		}
-		runs = append(runs, runeRange{start: start, end: i})
-	}
-	if len(runs) < 2 {
-		return runs
-	}
-
-	merged := []runeRange{runs[0]}
-	for _, run := range runs[1:] {
-		last := &merged[len(merged)-1]
-		if canMergeSpacedLetters(censored[last.start:run.end]) && run.start-last.end <= 4 {
-			last.end = run.end
-			continue
-		}
-		merged = append(merged, run)
-	}
-	return merged
-}
-
-func canMergeSpacedLetters(rs []rune) bool {
-	stars := 0
-	inRun := false
-	for _, r := range rs {
-		if r == '*' {
-			if inRun {
-				return false
+func tokens(text string) []token {
+	var out []token
+	var b strings.Builder
+	start := -1
+	for index, r := range text {
+		if !isTokenRune(r) {
+			if b.Len() > 0 {
+				out = append(out, token{text: b.String(), start: start})
+				b.Reset()
+				start = -1
 			}
-			stars++
-			inRun = true
 			continue
 		}
-		inRun = false
-		if !unicode.IsSpace(r) {
-			return false
+		if start == -1 {
+			start = index
 		}
+		b.WriteRune(r)
 	}
-	return stars > 1
+	if b.Len() > 0 {
+		out = append(out, token{text: b.String(), start: start})
+	}
+	return out
 }
 
-func fallbackWord(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return unicode.ToLower(r)
+func isTokenRune(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return true
+	}
+	_, ok := goaway.DefaultCharacterReplacements[r]
+	return ok
+}
+
+func normalize(s string) string {
+	s = strings.TrimFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if replacement, ok := goaway.DefaultCharacterReplacements[r]; ok {
+			r = replacement
 		}
-		return -1
-	}, s)
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return collapseRepeats(b.String())
+}
+
+func collapseRepeats(s string) string {
+	var b strings.Builder
+	var previous rune
+	repeat := 0
+	for _, r := range s {
+		if r == previous {
+			repeat++
+			if repeat > 1 {
+				continue
+			}
+		} else {
+			repeat = 0
+		}
+		b.WriteRune(r)
+		previous = r
+	}
+	return b.String()
+}
+
+func unique(words []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(words))
+	for _, word := range words {
+		word = strings.ToLower(strings.TrimSpace(word))
+		if word == "" || seen[word] || moderationOnlyTerms[word] {
+			continue
+		}
+		seen[word] = true
+		out = append(out, word)
+	}
+	return out
+}
+
+var moderationOnlyTerms = map[string]bool{
+	"anal":      true,
+	"anus":      true,
+	"balls":     true,
+	"ballsack":  true,
+	"blowjob":   true,
+	"boner":     true,
+	"boob":      true,
+	"butt":      true,
+	"choad":     true,
+	"clitoris":  true,
+	"cum":       true,
+	"dildo":     true,
+	"fellate":   true,
+	"fellatio":  true,
+	"felching":  true,
+	"flange":    true,
+	"horny":     true,
+	"incest":    true,
+	"jizz":      true,
+	"labia":     true,
+	"masturbat": true,
+	"muff":      true,
+	"naked":     true,
+	"nipple":    true,
+	"nips":      true,
+	"nude":      true,
+	"pedophile": true,
+	"penis":     true,
+	"poop":      true,
+	"porn":      true,
+	"prostitut": true,
+	"pube":      true,
+	"pussie":    true,
+	"rimjob":    true,
+	"scrotum":   true,
+	"sex":       true,
+	"spunk":     true,
+	"tits":      true,
+	"tittie":    true,
+	"titty":     true,
+	"turd":      true,
+	"vagina":    true,
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }

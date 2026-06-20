@@ -30,10 +30,9 @@ type AgentRow struct {
 }
 
 type WordRow struct {
-	Group  string  `json:"group"`
-	Source string  `json:"source"`
-	Count  int64   `json:"count"`
-	Share  float64 `json:"share"`
+	Group string  `json:"group"`
+	Count int64   `json:"count"`
+	Share float64 `json:"share"`
 }
 
 type VariantRow struct {
@@ -49,3 +48,26 @@ type SessionRow struct {
 	Messages int64  `json:"messages"`
 	Swears   int64  `json:"swears"`
 }
+
+type ProgressKind string
+
+const (
+	ProgressAdapterStart ProgressKind = "adapter_start"
+	ProgressMessage      ProgressKind = "message"
+	ProgressAdapterDone  ProgressKind = "adapter_done"
+)
+
+type Progress struct {
+	Kind          ProgressKind
+	Agent         string
+	AdapterIndex  int
+	AdapterTotal  int
+	AdaptersDone  int64
+	Messages      int64
+	Swears        int64
+	AgentMessages int64
+	AgentSwears   int64
+	LastWord      string
+}
+
+type ProgressFunc func(Progress)
