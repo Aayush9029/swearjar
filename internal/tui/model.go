@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/Aayush9029/swearjar/internal/analytics"
@@ -12,8 +11,6 @@ import (
 
 type Model struct {
 	report analytics.Report
-	tab    int
-	cursor int
 	width  int
 	height int
 }
@@ -46,28 +43,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
-		case "tab", "right", "l":
-			m.tab = (m.tab + 1) % 4
-			m.cursor = 0
-		case "shift+tab", "left", "h":
-			m.tab = (m.tab + 3) % 4
-			m.cursor = 0
-		case "1":
-			m.tab, m.cursor = 0, 0
-		case "2":
-			m.tab, m.cursor = 1, 0
-		case "3":
-			m.tab, m.cursor = 2, 0
-		case "4":
-			m.tab, m.cursor = 3, 0
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "down", "j":
-			if m.cursor < m.currentMax()-1 {
-				m.cursor++
-			}
 		}
 	}
 	return m, nil
@@ -77,36 +52,18 @@ func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.headerView())
 	b.WriteString("\n\n")
-	switch m.tab {
-	case 0:
-		b.WriteString(m.overview())
-	case 1:
-		b.WriteString(m.agents())
-	case 2:
-		b.WriteString(m.words())
-	case 3:
-		b.WriteString(m.sessions())
-	}
+	b.WriteString(m.overview())
 	b.WriteString("\n\n")
-	b.WriteString(dim.Render("tab switch · j/k move · 1-4 jump · q quit"))
+	b.WriteString(dim.Render("q quit"))
 	return b.String()
 }
 
 func (m Model) headerView() string {
-	tabs := []string{"overview", "agents", "words", "sessions"}
-	parts := make([]string, len(tabs))
-	for i, tab := range tabs {
-		if i == m.tab {
-			parts[i] = selected.Render(tab)
-		} else {
-			parts[i] = dim.Render(tab)
-		}
-	}
 	scope := m.report.Scope
 	if scope == "" {
 		scope = "all local history"
 	}
-	return title.Render("swearjar") + dim.Render("  "+scope+"  ") + strings.Join(parts, dim.Render(" / "))
+	return title.Render("swearjar") + dim.Render("  "+scope)
 }
 
 func (m Model) overview() string {
@@ -119,121 +76,39 @@ func (m Model) overview() string {
 
 	if len(m.report.Agents) > 0 {
 		b.WriteString("\n")
-		b.WriteString(header.Render("agent language"))
+		b.WriteString(header.Render("agents"))
 		b.WriteString("\n")
-		for _, row := range m.report.Agents {
-			b.WriteString(fmt.Sprintf("  %-10s %5d  %s\n", agentStyle(row.Agent).Render(row.Agent), row.Swears, dim.Render(fmt.Sprintf("%d messages · %.1f%%", row.Messages, row.Rate))))
+		maxSwears := maxAgentSwears(m.report.Agents)
+		for _, row := range m.report.Agents[:min(len(m.report.Agents), 6)] {
+			b.WriteString(fmt.Sprintf("  %-10s %5d  %-22s %s\n",
+				agentStyle(row.Agent).Render(row.Agent),
+				row.Swears,
+				dim.Render(fmt.Sprintf("%d messages · %.1f%%", row.Messages, row.Rate)),
+				tuiBar(row.Swears, maxSwears, 18)))
 		}
 	}
+
 	if len(m.report.Words) > 0 {
 		b.WriteString("\n")
 		b.WriteString(header.Render("top words"))
 		b.WriteString("\n")
-		for _, row := range m.report.Words[:min(len(m.report.Words), 8)] {
-			b.WriteString(fmt.Sprintf("  %-12s %5d  %s\n", selected.Render(row.Group), row.Count, dim.Render(fmt.Sprintf("%.1f%%", row.Share))))
+		maxCount := m.report.Words[0].Count
+		for _, row := range m.report.Words[:min(len(m.report.Words), 10)] {
+			b.WriteString(fmt.Sprintf("  %-12s %5d  %-8s %s\n",
+				selected.Render(row.Group),
+				row.Count,
+				dim.Render(fmt.Sprintf("%.1f%%", row.Share)),
+				tuiBar(row.Count, maxCount, 18)))
 		}
 	} else if m.report.Totals.Messages > 0 {
 		b.WriteString("\n")
 		b.WriteString(lipgloss.NewStyle().Foreground(green).Render("  the jar is empty. not a single swear found."))
 	}
+
 	if m.report.Totals.Messages == 0 {
 		b.WriteString(dim.Render("  no local messages found"))
 	}
 	return b.String()
-}
-
-func (m Model) agents() string {
-	rows := m.report.Agents
-	if len(rows) == 0 {
-		return dim.Render("no agents found")
-	}
-	max := slices.MaxFunc(rows, func(a, b analytics.AgentRow) int {
-		return int(a.Swears - b.Swears)
-	}).Swears
-
-	var b strings.Builder
-	b.WriteString(header.Render("agents"))
-	b.WriteString("\n")
-	for i, row := range rows {
-		prefix := "  "
-		if i == m.cursor {
-			prefix = selected.Render("› ")
-		}
-		b.WriteString(fmt.Sprintf("%s%-10s %5d  %-20s %s\n",
-			prefix,
-			agentStyle(row.Agent).Render(row.Agent),
-			row.Swears,
-			dim.Render(fmt.Sprintf("%d messages · %.1f%%", row.Messages, row.Rate)),
-			tuiBar(row.Swears, max, 22)))
-	}
-	return b.String()
-}
-
-func (m Model) words() string {
-	rows := m.report.Words
-	if len(rows) == 0 {
-		return dim.Render("no swears found")
-	}
-	max := rows[0].Count
-	var b strings.Builder
-	b.WriteString(header.Render("words"))
-	b.WriteString("\n")
-	for i, row := range rows {
-		prefix := "  "
-		if i == m.cursor {
-			prefix = selected.Render("› ")
-		}
-		variants := topVariants(m.report.Variants, row.Group)
-		b.WriteString(fmt.Sprintf("%s%-12s %5d  %-14s %s %s\n",
-			prefix,
-			selected.Render(row.Group),
-			row.Count,
-			dim.Render(fmt.Sprintf("%.1f%%", row.Share)),
-			tuiBar(row.Count, max, 18),
-			dim.Render(variants)))
-	}
-	return b.String()
-}
-
-func (m Model) sessions() string {
-	rows := m.report.Sessions
-	if len(rows) == 0 {
-		return dim.Render("no sessions found")
-	}
-	var b strings.Builder
-	b.WriteString(header.Render("sessions"))
-	b.WriteString("\n")
-	limit := min(len(rows), max(8, m.height-5))
-	for i, row := range rows[:limit] {
-		prefix := "  "
-		if i == m.cursor {
-			prefix = selected.Render("› ")
-		}
-		session := row.Session
-		if len(session) > 34 {
-			session = session[:31] + "..."
-		}
-		b.WriteString(fmt.Sprintf("%s%-9s %-34s %5d  %s\n",
-			prefix,
-			agentStyle(row.Agent).Render(row.Agent),
-			session,
-			row.Swears,
-			dim.Render(fmt.Sprintf("%d messages", row.Messages))))
-	}
-	return b.String()
-}
-
-func (m Model) currentMax() int {
-	switch m.tab {
-	case 1:
-		return len(m.report.Agents)
-	case 2:
-		return len(m.report.Words)
-	case 3:
-		return len(m.report.Sessions)
-	default:
-		return 0
-	}
 }
 
 func agentStyle(agent string) lipgloss.Style {
@@ -266,16 +141,12 @@ func tuiBar(value, max int64, width int) string {
 		dim.Render(strings.Repeat("░", width-n))
 }
 
-func topVariants(rows []analytics.VariantRow, group string) string {
-	var parts []string
+func maxAgentSwears(rows []analytics.AgentRow) int64 {
+	var max int64
 	for _, row := range rows {
-		if row.Group != group || row.Word == group {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s %d", row.Word, row.Count))
-		if len(parts) == 3 {
-			break
+		if row.Swears > max {
+			max = row.Swears
 		}
 	}
-	return strings.Join(parts, ", ")
+	return max
 }

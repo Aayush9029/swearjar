@@ -196,7 +196,7 @@ func (m scanModel) View() string {
 	b.WriteString(m.agentProgressView())
 	b.WriteString("\n\n  ")
 	b.WriteString(dim.Render("q quit"))
-	return b.String()
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func (m scanModel) waitEvent() tea.Cmd {
@@ -260,18 +260,20 @@ func (m scanModel) statusText() string {
 }
 
 func (m scanModel) agentProgressView() string {
-	if len(m.agentOrder) == 0 {
+	visible := m.visibleAgents()
+	if len(visible) == 0 {
 		return dim.Render("  waiting for adapters")
 	}
 	maxSwears := int64(1)
-	for _, row := range m.agents {
+	for _, name := range visible {
+		row := m.agents[name]
 		if row.Swears > maxSwears {
 			maxSwears = row.Swears
 		}
 	}
-	limit := min(len(m.agentOrder), max(4, m.height-12))
+	limit := min(len(visible), max(4, m.height-12))
 	var b strings.Builder
-	for _, name := range m.agentOrder[:limit] {
+	for _, name := range visible[:limit] {
 		row := m.agents[name]
 		state := dim.Render("queued")
 		if row.Active {
@@ -287,6 +289,18 @@ func (m scanModel) agentProgressView() string {
 			tuiBar(row.Swears, maxSwears, 18)))
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m scanModel) visibleAgents() []string {
+	out := make([]string, 0, len(m.agentOrder))
+	for _, name := range m.agentOrder {
+		row := m.agents[name]
+		if row.Messages == 0 && row.Swears == 0 && row.Done {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
 }
 
 func adapterNames(adapters []agent.Adapter) []string {

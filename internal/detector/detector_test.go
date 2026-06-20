@@ -44,3 +44,19 @@ func TestDetectSkipsModerationOnlyTerms(t *testing.T) {
 		t.Fatalf("count=%d want 0 (%+v)", got.Count, got.Matches)
 	}
 }
+
+func TestDetectSkipsCommonWordFuzzyNoise(t *testing.T) {
+	d := New()
+	got := d.Detect("that where batch pick icon dock count parse want func docker prickly grape scrap")
+	if got.Count != 0 {
+		t.Fatalf("count=%d want 0 (%+v)", got.Count, got.Matches)
+	}
+}
+
+func TestDetectKeepsSwearTyposAndCompounds(t *testing.T) {
+	d := New()
+	got := d.Detect("fukc bullshit fucking")
+	if got.Count != 3 {
+		t.Fatalf("count=%d want 3 (%+v)", got.Count, got.Matches)
+	}
+}

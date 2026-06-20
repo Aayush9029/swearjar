@@ -91,6 +91,9 @@ func (d *Detector) matchToken(token string) []string {
 	if d.exact[candidate] {
 		return []string{candidate}
 	}
+	if knownWord(candidate) {
+		return nil
+	}
 	for _, word := range d.words {
 		if d.matchesCompound(candidate, word) {
 			return []string{word}
@@ -123,6 +126,9 @@ func (d *Detector) matchesCompound(token, word string) bool {
 	if len(word) < 4 || len(token) <= len(word) {
 		return false
 	}
+	if len(token)-len(word) < 2 {
+		return false
+	}
 	if !strings.Contains(token, word) {
 		return false
 	}
@@ -136,6 +142,9 @@ func (d *Detector) matchesCompound(token, word string) bool {
 
 func (d *Detector) fuzzyMatch(token string) (string, bool) {
 	if len(token) < 4 {
+		return "", false
+	}
+	if knownWord(token) {
 		return "", false
 	}
 
@@ -158,13 +167,10 @@ func (d *Detector) fuzzyMatch(token string) (string, bool) {
 }
 
 func fuzzyOK(token, word string, distance int) bool {
-	if distance <= 1 {
-		return true
-	}
 	if len(token) == len(word) && adjacentTranspose(token, word) {
 		return true
 	}
-	return len(word) >= 7 && distance <= 2
+	return len(word) >= 7 && distance <= 1
 }
 
 func adjacentTranspose(a, b string) bool {
