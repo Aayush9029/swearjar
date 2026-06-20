@@ -38,7 +38,7 @@ func Report(w io.Writer, report analytics.Report, color bool) {
 	if len(report.Words) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintf(w, "  %stop words%s %s(share of swears)%s\n", c.bold, c.reset, c.dim, c.reset)
-		for _, row := range report.Words {
+		for _, row := range report.Words[:min(len(report.Words), analytics.TopWords)] {
 			fmt.Fprintf(w, "    %s%-12s%s %s%5d%s  %s%5.1f%%%s  %s\n",
 				c.yellow, row.Group, c.reset,
 				c.bold, row.Count, c.reset,

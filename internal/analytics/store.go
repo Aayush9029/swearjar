@@ -36,6 +36,7 @@ type Store struct {
 const (
 	flushRows    = 4096
 	indexVersion = "exact-v1"
+	TopWords     = 5
 )
 
 type messageRow struct {
@@ -483,8 +484,8 @@ func queryWords(ctx context.Context, db *sql.DB, total int64) ([]WordRow, error)
 		FROM scoped_matches
 		GROUP BY group_name
 		ORDER BY swears DESC, group_name ASC
-		LIMIT 30
-	`)
+		LIMIT ?
+	`, TopWords)
 	if err != nil {
 		return nil, err
 	}
