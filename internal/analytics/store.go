@@ -33,7 +33,10 @@ type Store struct {
 	completedSources map[string]agent.Source
 }
 
-const flushRows = 4096
+const (
+	flushRows    = 4096
+	indexVersion = "exact-v1"
+)
 
 type messageRow struct {
 	ID        int64
@@ -105,6 +108,7 @@ func (s *Store) init(ctx context.Context) error {
 			project VARCHAR,
 			size BIGINT,
 			mod_time BIGINT,
+			index_version VARCHAR,
 			indexed_at TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS run_sources (
@@ -136,6 +140,9 @@ func (s *Store) init(ctx context.Context) error {
 		}
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT coalesce(max(id), 0) FROM messages`).Scan(&s.nextID); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE sources ADD COLUMN IF NOT EXISTS index_version VARCHAR`); err != nil {
 		return err
 	}
 	if s.indexed {
@@ -192,8 +199,9 @@ func (s *Store) BeginSource(ctx context.Context, src agent.Source) (bool, error)
 
 	var size int64
 	var modTime int64
-	err := s.db.QueryRowContext(ctx, `SELECT size, mod_time FROM sources WHERE source_key = ? LIMIT 1`, key).Scan(&size, &modTime)
-	if err == nil && size == src.Size && modTime == src.ModTime {
+	var version string
+	err := s.db.QueryRowContext(ctx, `SELECT size, mod_time, coalesce(index_version, '') FROM sources WHERE source_key = ? ORDER BY indexed_at DESC LIMIT 1`, key).Scan(&size, &modTime, &version)
+	if err == nil && size == src.Size && modTime == src.ModTime && version == indexVersion {
 		return false, nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -301,9 +309,9 @@ func (s *Store) finalizeSources(ctx context.Context) error {
 	for key, src := range s.completedSources {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO sources
-			(source_key, agent, path, session, project, size, mod_time, indexed_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, now())
-		`, key, src.Agent, src.Path, src.Session, src.Project, src.Size, src.ModTime)
+			(source_key, agent, path, session, project, size, mod_time, index_version, indexed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())
+		`, key, src.Agent, src.Path, src.Session, src.Project, src.Size, src.ModTime, indexVersion)
 		if err != nil {
 			return err
 		}

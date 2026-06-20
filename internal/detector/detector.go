@@ -6,7 +6,6 @@ import (
 	"unicode"
 
 	goaway "github.com/TwiN/go-away"
-	"github.com/agnivade/levenshtein"
 )
 
 type Match struct {
@@ -103,11 +102,7 @@ func (d *Detector) matchToken(token string) []string {
 		return nil
 	}
 
-	word, ok := d.fuzzyMatch(candidate)
-	if !ok {
-		return nil
-	}
-	return []string{word}
+	return nil
 }
 
 func (d *Detector) withoutFalsePositives(token string) (string, bool) {
@@ -138,62 +133,6 @@ func (d *Detector) matchesCompound(token, word string) bool {
 		return false
 	}
 	return len(token)-len(word) <= 6
-}
-
-func (d *Detector) fuzzyMatch(token string) (string, bool) {
-	if len(token) < 4 {
-		return "", false
-	}
-	if knownWord(token) {
-		return "", false
-	}
-
-	bestWord := ""
-	bestDistance := 99
-	for _, word := range d.words {
-		if len(word) < 4 || abs(len(token)-len(word)) > 2 || token[0] != word[0] {
-			continue
-		}
-		distance := levenshtein.ComputeDistance(token, word)
-		if !fuzzyOK(token, word, distance) {
-			continue
-		}
-		if distance < bestDistance {
-			bestWord = word
-			bestDistance = distance
-		}
-	}
-	return bestWord, bestWord != ""
-}
-
-func fuzzyOK(token, word string, distance int) bool {
-	if len(token) == len(word) && adjacentTranspose(token, word) {
-		return true
-	}
-	return len(word) >= 7 && distance <= 1
-}
-
-func adjacentTranspose(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	first := -1
-	second := -1
-	for i := range a {
-		if a[i] == b[i] {
-			continue
-		}
-		if first == -1 {
-			first = i
-			continue
-		}
-		if second == -1 {
-			second = i
-			continue
-		}
-		return false
-	}
-	return first >= 0 && second == first+1 && a[first] == b[second] && a[second] == b[first]
 }
 
 type token struct {
@@ -325,11 +264,4 @@ var moderationOnlyTerms = map[string]bool{
 	"titty":     true,
 	"turd":      true,
 	"vagina":    true,
-}
-
-func abs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 }

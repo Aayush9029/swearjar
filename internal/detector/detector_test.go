@@ -4,7 +4,7 @@ import "testing"
 
 func TestDetectCountsGroupsAndRepeats(t *testing.T) {
 	d := New()
-	got := d.Detect("this fukc thing is bullshit")
+	got := d.Detect("this fuck thing is bullshit")
 	if got.Count != 2 {
 		t.Fatalf("count=%d want 2 (%+v)", got.Count, got.Matches)
 	}
@@ -45,7 +45,7 @@ func TestDetectSkipsModerationOnlyTerms(t *testing.T) {
 	}
 }
 
-func TestDetectSkipsCommonWordFuzzyNoise(t *testing.T) {
+func TestDetectSkipsCommonWordNoise(t *testing.T) {
 	d := New()
 	got := d.Detect("that where batch pick icon dock count parse want func docker prickly grape scrap")
 	if got.Count != 0 {
@@ -53,10 +53,13 @@ func TestDetectSkipsCommonWordFuzzyNoise(t *testing.T) {
 	}
 }
 
-func TestDetectKeepsSwearTyposAndCompounds(t *testing.T) {
+func TestDetectSkipsTyposAndKeepsCompounds(t *testing.T) {
 	d := New()
 	got := d.Detect("fukc bullshit fucking")
-	if got.Count != 3 {
-		t.Fatalf("count=%d want 3 (%+v)", got.Count, got.Matches)
+	if got.Count != 2 {
+		t.Fatalf("count=%d want 2 (%+v)", got.Count, got.Matches)
+	}
+	if got.Matches[0].Group != "shit" || got.Matches[1].Group != "fuck" {
+		t.Fatalf("matches=%+v", got.Matches)
 	}
 }
