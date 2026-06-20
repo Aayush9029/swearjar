@@ -101,10 +101,15 @@ func cmdUI(ctx context.Context, args []string) error {
 		render.Report(os.Stdout, report, false)
 		return nil
 	}
-	return tui.RunScan(ctx, adapters, agent.Options{
+	report, err := tui.RunScan(ctx, adapters, agent.Options{
 		Since: opts.since,
 		Paths: opts.paths,
 	}, opts.scope)
+	if err != nil {
+		return err
+	}
+	render.Report(os.Stdout, report, true)
+	return nil
 }
 
 func buildReport(ctx context.Context, opts options) (analytics.Report, error) {

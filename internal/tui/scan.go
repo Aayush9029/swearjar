@@ -31,7 +31,7 @@ type scanModel struct {
 	swears       int64
 	lastAgent    string
 	lastWord     string
-	report       Model
+	finalReport  analytics.Report
 	done         bool
 	err          error
 }
@@ -53,7 +53,7 @@ type scanEvent struct {
 
 type scanEventMsg scanEvent
 
-func RunScan(ctx context.Context, adapters []agent.Adapter, opts agent.Options, scope string) error {
+func RunScan(ctx context.Context, adapters []agent.Adapter, opts agent.Options, scope string) (analytics.Report, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	events := make(chan scanEvent, 256)
 	finished := make(chan struct{})
@@ -86,10 +86,21 @@ func RunScan(ctx context.Context, adapters []agent.Adapter, opts agent.Options, 
 		agents:       scanAgents(adapters),
 		adapterTotal: len(adapters),
 	}
-	_, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
+	finalModel, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
 	cancel()
 	<-finished
-	return err
+	if err != nil {
+		return analytics.Report{}, err
+	}
+	if m, ok := finalModel.(scanModel); ok {
+		if m.err != nil {
+			return analytics.Report{}, m.err
+		}
+		if m.done {
+			return m.finalReport, nil
+		}
+	}
+	return analytics.Report{}, context.Canceled
 }
 
 func (m scanModel) Init() tea.Cmd {
@@ -97,21 +108,11 @@ func (m scanModel) Init() tea.Cmd {
 }
 
 func (m scanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if m.done && m.err == nil {
-		updated, cmd := m.report.Update(msg)
-		if next, ok := updated.(Model); ok {
-			m.report = next
-		}
-		return m, cmd
-	}
-
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.progress.Width = max(18, min(msg.Width-6, 64))
-		m.report.width = msg.Width
-		m.report.height = msg.Height
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
@@ -137,11 +138,11 @@ func (m scanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Err != nil {
 				m.done = true
 				m.err = msg.Err
-				return m, nil
+				return m, tea.Quit
 			}
 			m.done = true
-			m.report = Model{report: msg.Report, width: m.width, height: m.height}
-			return m, nil
+			m.finalReport = msg.Report
+			return m, tea.Quit
 		}
 		return m, m.waitEvent()
 	}
@@ -150,10 +151,10 @@ func (m scanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m scanModel) View() string {
 	if m.done && m.err == nil {
-		return m.report.View()
+		return ""
 	}
 	if m.err != nil {
-		return "\n  " + title.Render("swearjar") + "\n\n  " + lipgloss.NewStyle().Foreground(accent).Render(m.err.Error()) + "\n\n  " + dim.Render("q quit")
+		return "\n  " + title.Render("swearjar") + "\n\n  " + lipgloss.NewStyle().Foreground(accent).Render(m.err.Error())
 	}
 
 	scope := m.scope
@@ -194,8 +195,6 @@ func (m scanModel) View() string {
 	}
 	b.WriteString("\n\n")
 	b.WriteString(m.agentProgressView())
-	b.WriteString("\n\n  ")
-	b.WriteString(dim.Render("q quit"))
 	return strings.TrimRight(b.String(), "\n")
 }
 

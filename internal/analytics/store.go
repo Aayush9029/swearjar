@@ -6,7 +6,10 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,17 +21,23 @@ import (
 )
 
 type Store struct {
-	db              *sql.DB
-	nextID          int64
-	startedAt       time.Time
-	pendingMessages []messageRow
-	pendingMatches  []matchRow
+	db               *sql.DB
+	mu               sync.Mutex
+	nextID           int64
+	startedAt        time.Time
+	indexed          bool
+	runID            string
+	since            *time.Time
+	pendingMessages  []messageRow
+	pendingMatches   []matchRow
+	completedSources map[string]agent.Source
 }
 
 const flushRows = 4096
 
 type messageRow struct {
 	ID        int64
+	SourceKey string
 	Agent     string
 	Session   string
 	Project   string
@@ -38,6 +47,7 @@ type messageRow struct {
 
 type matchRow struct {
 	MessageID int64
+	SourceKey string
 	Agent     string
 	Session   string
 	Project   string
@@ -47,13 +57,37 @@ type matchRow struct {
 }
 
 func New(ctx context.Context) (*Store, error) {
-	db, err := sql.Open("duckdb", "")
+	return newStore(ctx, "", false, nil)
+}
+
+func NewIndexed(ctx context.Context, since *time.Time) (*Store, error) {
+	path, err := indexPath()
+	if err != nil {
+		return nil, err
+	}
+	return newStore(ctx, path, true, since)
+}
+
+func newStore(ctx context.Context, path string, indexed bool, since *time.Time) (*Store, error) {
+	if path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, err
+		}
+	}
+	db, err := sql.Open("duckdb", path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 
-	store := &Store{db: db, startedAt: time.Now()}
+	store := &Store{
+		db:               db,
+		startedAt:        time.Now(),
+		indexed:          indexed,
+		runID:            fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
+		since:            since,
+		completedSources: map[string]agent.Source{},
+	}
 	if err := store.init(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -63,16 +97,32 @@ func New(ctx context.Context) (*Store, error) {
 
 func (s *Store) init(ctx context.Context) error {
 	for _, query := range []string{
-		`CREATE TABLE messages (
+		`CREATE TABLE IF NOT EXISTS sources (
+			source_key VARCHAR,
+			agent VARCHAR,
+			path VARCHAR,
+			session VARCHAR,
+			project VARCHAR,
+			size BIGINT,
+			mod_time BIGINT,
+			indexed_at TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS run_sources (
+			run_id VARCHAR,
+			source_key VARCHAR
+		)`,
+		`CREATE TABLE IF NOT EXISTS messages (
 			id BIGINT,
+			source_key VARCHAR,
 			agent VARCHAR,
 			session VARCHAR,
 			project VARCHAR,
 			ts VARCHAR,
 			chars BIGINT
 		)`,
-		`CREATE TABLE matches (
+		`CREATE TABLE IF NOT EXISTS matches (
 			message_id BIGINT,
+			source_key VARCHAR,
 			agent VARCHAR,
 			session VARCHAR,
 			project VARCHAR,
@@ -85,14 +135,24 @@ func (s *Store) init(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.db.QueryRowContext(ctx, `SELECT coalesce(max(id), 0) FROM messages`).Scan(&s.nextID); err != nil {
+		return err
+	}
+	if s.indexed {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM run_sources`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (s *Store) Insert(ctx context.Context, msg agent.Message, result detector.Result) error {
 	s.nextID++
 	id := s.nextID
+	sourceKey := messageSourceKey(msg, id)
 	s.pendingMessages = append(s.pendingMessages, messageRow{
 		ID:        id,
+		SourceKey: sourceKey,
 		Agent:     msg.Agent,
 		Session:   msg.Session,
 		Project:   msg.Project,
@@ -102,6 +162,7 @@ func (s *Store) Insert(ctx context.Context, msg agent.Message, result detector.R
 	for _, match := range result.Matches {
 		s.pendingMatches = append(s.pendingMatches, matchRow{
 			MessageID: id,
+			SourceKey: sourceKey,
 			Agent:     msg.Agent,
 			Session:   msg.Session,
 			Project:   msg.Project,
@@ -116,18 +177,86 @@ func (s *Store) Insert(ctx context.Context, msg agent.Message, result detector.R
 	return nil
 }
 
+func (s *Store) BeginSource(ctx context.Context, src agent.Source) (bool, error) {
+	if !s.indexed || src.Path == "" {
+		return true, nil
+	}
+	key := sourceKey(src)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.addRunSourceLocked(ctx, key); err != nil {
+		return false, err
+	}
+
+	var size int64
+	var modTime int64
+	err := s.db.QueryRowContext(ctx, `SELECT size, mod_time FROM sources WHERE source_key = ? LIMIT 1`, key).Scan(&size, &modTime)
+	if err == nil && size == src.Size && modTime == src.ModTime {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	for _, query := range []string{
+		`DELETE FROM matches WHERE source_key = ?`,
+		`DELETE FROM messages WHERE source_key = ?`,
+		`DELETE FROM sources WHERE source_key = ?`,
+	} {
+		if _, err := s.db.ExecContext(ctx, query, key); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (s *Store) FinishSource(ctx context.Context, src agent.Source) error {
+	if !s.indexed || src.Path == "" {
+		return nil
+	}
+	key := sourceKey(src)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.addRunSourceLocked(ctx, key); err != nil {
+		return err
+	}
+	s.completedSources[key] = src
+	return nil
+}
+
+func (s *Store) addRunSourceLocked(ctx context.Context, key string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO run_sources
+		SELECT ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM run_sources WHERE run_id = ? AND source_key = ?
+		)
+	`, s.runID, key, s.runID, key)
+	return err
+}
+
 func (s *Store) Report(ctx context.Context, scope string) (Report, error) {
 	if err := s.Flush(ctx); err != nil {
+		return Report{}, err
+	}
+	if err := s.finalizeSources(ctx); err != nil {
+		return Report{}, err
+	}
+	if err := s.createScopedViews(ctx); err != nil {
 		return Report{}, err
 	}
 
 	var totals Totals
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT
-			(SELECT count(*) FROM messages),
-			(SELECT count(*) FROM matches),
-			(SELECT count(DISTINCT agent || ':' || session) FROM messages WHERE session <> ''),
-			(SELECT coalesce(sum(chars), 0) FROM messages)
+			(SELECT count(*) FROM scoped_messages),
+			(SELECT count(*) FROM scoped_matches),
+			(SELECT count(DISTINCT agent || ':' || session) FROM scoped_messages WHERE session <> ''),
+			(SELECT coalesce(sum(chars), 0) FROM scoped_messages)
 	`).Scan(&totals.Messages, &totals.Swears, &totals.Sessions, &totals.Chars); err != nil {
 		return Report{}, err
 	}
@@ -162,6 +291,61 @@ func (s *Store) Report(ctx context.Context, scope string) (Report, error) {
 	}, nil
 }
 
+func (s *Store) finalizeSources(ctx context.Context) error {
+	if !s.indexed || len(s.completedSources) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, src := range s.completedSources {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO sources
+			(source_key, agent, path, session, project, size, mod_time, indexed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, now())
+		`, key, src.Agent, src.Path, src.Session, src.Project, src.Size, src.ModTime)
+		if err != nil {
+			return err
+		}
+		delete(s.completedSources, key)
+	}
+	return nil
+}
+
+func (s *Store) createScopedViews(ctx context.Context) error {
+	for _, query := range []string{
+		`DROP VIEW IF EXISTS scoped_matches`,
+		`DROP VIEW IF EXISTS scoped_messages`,
+	} {
+		if _, err := s.db.ExecContext(ctx, query); err != nil {
+			return err
+		}
+	}
+
+	sourceSQL := `SELECT * FROM messages`
+	if s.indexed {
+		sourceSQL = `SELECT m.* FROM messages m JOIN run_sources rs ON rs.source_key = m.source_key WHERE rs.run_id = ` + sqlString(s.runID)
+	}
+	if s.since != nil {
+		filter := `(ts = '' OR try_cast(ts AS TIMESTAMPTZ) IS NULL OR try_cast(ts AS TIMESTAMPTZ) >= try_cast(` + sqlString(s.since.Format(time.RFC3339Nano)) + ` AS TIMESTAMPTZ))`
+		if strings.Contains(sourceSQL, " WHERE ") {
+			sourceSQL += " AND " + filter
+		} else {
+			sourceSQL += " WHERE " + filter
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE TEMP VIEW scoped_messages AS `+sourceSQL); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		CREATE TEMP VIEW scoped_matches AS
+		SELECT mt.*
+		FROM matches mt
+		JOIN scoped_messages sm ON sm.id = mt.message_id
+	`)
+	return err
+}
+
 func (s *Store) Close() error {
 	err := s.Flush(context.Background())
 	if s.db != nil {
@@ -176,6 +360,8 @@ func (s *Store) Flush(ctx context.Context) error {
 	if len(s.pendingMessages) == 0 && len(s.pendingMatches) == 0 {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.appendRows(ctx, s.pendingMessages, s.pendingMatches); err != nil {
 		return err
 	}
@@ -212,7 +398,7 @@ func appendMessages(conn driver.Conn, rows []messageRow) error {
 		return err
 	}
 	for _, row := range rows {
-		if err := appender.AppendRow(row.ID, row.Agent, row.Session, row.Project, row.Timestamp, row.Chars); err != nil {
+		if err := appender.AppendRow(row.ID, row.SourceKey, row.Agent, row.Session, row.Project, row.Timestamp, row.Chars); err != nil {
 			_ = appender.Close()
 			return err
 		}
@@ -233,7 +419,7 @@ func appendMatches(conn driver.Conn, rows []matchRow) error {
 		return err
 	}
 	for _, row := range rows {
-		if err := appender.AppendRow(row.MessageID, row.Agent, row.Session, row.Project, row.Timestamp, row.Word, row.Group); err != nil {
+		if err := appender.AppendRow(row.MessageID, row.SourceKey, row.Agent, row.Session, row.Project, row.Timestamp, row.Word, row.Group); err != nil {
 			_ = appender.Close()
 			return err
 		}
@@ -249,12 +435,12 @@ func queryAgents(ctx context.Context, db *sql.DB) ([]AgentRow, error) {
 	rows, err := db.QueryContext(ctx, `
 		WITH message_counts AS (
 			SELECT agent, count(*) AS messages, count(DISTINCT session) AS sessions
-			FROM messages
+			FROM scoped_messages
 			GROUP BY agent
 		),
 		match_counts AS (
 			SELECT agent, count(*) AS swears
-			FROM matches
+			FROM scoped_matches
 			GROUP BY agent
 		)
 		SELECT
@@ -286,7 +472,7 @@ func queryAgents(ctx context.Context, db *sql.DB) ([]AgentRow, error) {
 func queryWords(ctx context.Context, db *sql.DB, total int64) ([]WordRow, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT group_name, count(*) AS swears
-		FROM matches
+		FROM scoped_matches
 		GROUP BY group_name
 		ORDER BY swears DESC, group_name ASC
 		LIMIT 30
@@ -311,7 +497,7 @@ func queryWords(ctx context.Context, db *sql.DB, total int64) ([]WordRow, error)
 func queryVariants(ctx context.Context, db *sql.DB) ([]VariantRow, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT group_name, word, count(*) AS swears
-		FROM matches
+		FROM scoped_matches
 		GROUP BY group_name, word
 		ORDER BY swears DESC, group_name ASC, word ASC
 		LIMIT 80
@@ -336,13 +522,13 @@ func querySessions(ctx context.Context, db *sql.DB) ([]SessionRow, error) {
 	rows, err := db.QueryContext(ctx, `
 		WITH message_counts AS (
 			SELECT agent, session, any_value(project) AS project, count(*) AS messages
-			FROM messages
+			FROM scoped_messages
 			WHERE session <> ''
 			GROUP BY agent, session
 		),
 		match_counts AS (
 			SELECT agent, session, count(*) AS swears
-			FROM matches
+			FROM scoped_matches
 			WHERE session <> ''
 			GROUP BY agent, session
 		)
@@ -375,12 +561,35 @@ func percent(num, denom int64) float64 {
 	return float64(num) / float64(denom) * 100
 }
 
+func indexPath() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "swearjar", "index.duckdb"), nil
+}
+
+func sourceKey(src agent.Source) string {
+	return src.Agent + "\x00" + src.Path
+}
+
+func messageSourceKey(msg agent.Message, id int64) string {
+	if msg.Source.Path != "" {
+		return sourceKey(msg.Source)
+	}
+	return fmt.Sprintf("inline:%d", id)
+}
+
+func sqlString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
 func Scan(ctx context.Context, adapters []agent.Adapter, opts agent.Options, scope string) (Report, error) {
 	return ScanWithProgress(ctx, adapters, opts, scope, nil)
 }
 
 func ScanWithProgress(ctx context.Context, adapters []agent.Adapter, opts agent.Options, scope string, progress ProgressFunc) (Report, error) {
-	store, err := New(ctx)
+	store, err := NewIndexed(ctx, opts.Since)
 	if err != nil {
 		return Report{}, err
 	}
@@ -406,12 +615,15 @@ func ScanWithProgress(ctx context.Context, adapters []agent.Adapter, opts agent.
 
 	adapterGroup, adapterCtx := errgroup.WithContext(ctx)
 	var adaptersDone atomic.Int64
+	scanOpts := opts
+	scanOpts.Since = nil
+	scanOpts.SourceHook = store
 	for i, adapter := range adapters {
 		index := i + 1
 		adapter := adapter
 		adapterGroup.Go(func() error {
 			emit(Progress{Kind: ProgressAdapterStart, Agent: adapter.Name(), AdapterIndex: index, AdapterTotal: len(adapters), AdaptersDone: adaptersDone.Load()})
-			err := adapter.VisitMessages(adapterCtx, opts, func(msg agent.Message) error {
+			err := adapter.VisitMessages(adapterCtx, scanOpts, func(msg agent.Message) error {
 				select {
 				case <-adapterCtx.Done():
 					return adapterCtx.Err()

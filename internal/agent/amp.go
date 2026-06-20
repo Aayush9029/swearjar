@@ -18,6 +18,15 @@ func (Amp) VisitMessages(ctx context.Context, opts Options, visit func(Message) 
 	return walkFiles(root, func(path string) bool {
 		return strings.HasSuffix(path, ".json")
 	}, func(path string) error {
+		session := strings.TrimSuffix(filepath.Base(path), ".json")
+		src, err := fileSource("amp", path, session, "")
+		if err != nil {
+			return nil
+		}
+		read, err := beginSource(ctx, opts, src)
+		if err != nil || !read {
+			return err
+		}
 		var thread struct {
 			Messages []struct {
 				Role      string `json:"role"`
@@ -29,7 +38,6 @@ func (Amp) VisitMessages(ctx context.Context, opts Options, visit func(Message) 
 		if err := readJSONFile(path, &thread); err != nil {
 			return nil
 		}
-		session := strings.TrimSuffix(filepath.Base(path), ".json")
 		for _, msg := range thread.Messages {
 			select {
 			case <-ctx.Done():
@@ -50,10 +58,10 @@ func (Amp) VisitMessages(ctx context.Context, opts Options, visit func(Message) 
 			if !validSince(timestamp, opts.Since) {
 				continue
 			}
-			if err := visit(Message{Agent: "amp", Session: session, Timestamp: timestamp, Text: text}); err != nil {
+			if err := visit(Message{Agent: "amp", Session: session, Timestamp: timestamp, Text: text, Source: src}); err != nil {
 				return err
 			}
 		}
-		return nil
+		return finishSource(ctx, opts, src)
 	})
 }

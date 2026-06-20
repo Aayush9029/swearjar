@@ -20,7 +20,15 @@ func (Claude) VisitMessages(ctx context.Context, opts Options, visit func(Messag
 		if project == "subagents" {
 			project = filepath.Base(filepath.Dir(filepath.Dir(path)))
 		}
-		return scanJSONLines(path, func(entry map[string]any) error {
+		src, err := fileSource("claude", path, session, project)
+		if err != nil {
+			return nil
+		}
+		read, err := beginSource(ctx, opts, src)
+		if err != nil || !read {
+			return err
+		}
+		if err := scanJSONLines(path, func(entry map[string]any) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -53,7 +61,11 @@ func (Claude) VisitMessages(ctx context.Context, opts Options, visit func(Messag
 				Project:   project,
 				Timestamp: timestamp,
 				Text:      text,
+				Source:    src,
 			})
-		})
+		}); err != nil {
+			return err
+		}
+		return finishSource(ctx, opts, src)
 	})
 }

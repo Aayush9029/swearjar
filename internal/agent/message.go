@@ -14,16 +14,32 @@ type Message struct {
 	Project   string
 	Timestamp string
 	Text      string
+	Source    Source
 }
 
 type Options struct {
-	Since *time.Time
-	Paths []string
+	Since      *time.Time
+	Paths      []string
+	SourceHook SourceHook
 }
 
 type Adapter interface {
 	Name() string
 	VisitMessages(context.Context, Options, func(Message) error) error
+}
+
+type Source struct {
+	Agent   string
+	Path    string
+	Session string
+	Project string
+	Size    int64
+	ModTime int64
+}
+
+type SourceHook interface {
+	BeginSource(context.Context, Source) (bool, error)
+	FinishSource(context.Context, Source) error
 }
 
 func All() []Adapter {

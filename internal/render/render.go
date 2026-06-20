@@ -18,53 +18,36 @@ func Report(w io.Writer, report analytics.Report, color bool) {
 		return
 	}
 
-	fmt.Fprintf(w, "  %stotal%s\n", c.bold, c.reset)
-	fmt.Fprintf(w, "    %s%s%d%s swears  %s%d messages · %.1f%% · %s%s\n",
+	fmt.Fprintf(w, "  %s%s%d%s swears  %s%d user messages · %.1f%% · %s%s\n",
 		c.bold, c.yellow, report.Totals.Swears, c.reset,
 		c.dim, report.Totals.Messages, report.Totals.Rate, report.Duration, c.reset)
 
 	if len(report.Agents) > 0 {
 		fmt.Fprintln(w)
-		fmt.Fprintf(w, "  %sagents%s\n", c.bold, c.reset)
-		max := maxAgentSwears(report.Agents)
+		fmt.Fprintf(w, "  %sagents%s %s(share of swears)%s\n", c.bold, c.reset, c.dim, c.reset)
 		for _, row := range report.Agents {
-			fmt.Fprintf(w, "    %s%-10s%s %s%5d%s  %s%5d messages · %4.1f%%%s  %s\n",
+			share := percent(row.Swears, report.Totals.Swears)
+			fmt.Fprintf(w, "    %s%-10s%s %s%5d%s  %s%5.1f%% swears · %5d msgs · %5.1f%% rate%s  %s\n",
 				agentColor(row.Agent, c), row.Agent, c.reset,
 				c.bold, row.Swears, c.reset,
-				c.dim, row.Messages, row.Rate, c.reset,
-				bar(row.Swears, max, 18, color))
+				c.dim, share, row.Messages, row.Rate, c.reset,
+				barPercent(share, 22, color))
 		}
 	}
 
 	if len(report.Words) > 0 {
 		fmt.Fprintln(w)
-		fmt.Fprintf(w, "  %stop words%s\n", c.bold, c.reset)
+		fmt.Fprintf(w, "  %stop words%s %s(share of swears)%s\n", c.bold, c.reset, c.dim, c.reset)
 		for _, row := range report.Words {
-			fmt.Fprintf(w, "    %s%-12s%s %s%5d%s  %s%5.1f%%%s\n",
+			fmt.Fprintf(w, "    %s%-12s%s %s%5d%s  %s%5.1f%%%s  %s\n",
 				c.yellow, row.Group, c.reset,
 				c.bold, row.Count, c.reset,
-				c.dim, row.Share, c.reset)
+				c.dim, row.Share, c.reset,
+				barPercent(row.Share, 22, color))
 		}
 	} else {
 		fmt.Fprintln(w)
 		fmt.Fprintf(w, "  %sthe jar is empty. not a single swear found.%s\n", c.green, c.reset)
-	}
-
-	if len(report.Sessions) > 0 {
-		fmt.Fprintln(w)
-		fmt.Fprintf(w, "  %stop sessions%s\n", c.bold, c.reset)
-		limit := min(len(report.Sessions), 8)
-		for _, row := range report.Sessions[:limit] {
-			name := row.Session
-			if len(name) > 28 {
-				name = name[:25] + "..."
-			}
-			fmt.Fprintf(w, "    %s%-8s%s %-28s %s%4d%s %s\n",
-				agentColor(row.Agent, c), row.Agent, c.reset,
-				name,
-				c.bold, row.Swears, c.reset,
-				c.dim+"swears"+c.reset)
-		}
 	}
 	fmt.Fprintln(w)
 }
@@ -133,6 +116,25 @@ func bar(value, max int64, width int, color bool) string {
 	return ui.Cyan + fill + ui.Dim + empty + ui.Reset
 }
 
+func barPercent(percent float64, width int, color bool) string {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	n := int(percent / 100 * float64(width))
+	if percent > 0 && n == 0 {
+		n = 1
+	}
+	fill := strings.Repeat("█", n)
+	empty := strings.Repeat("░", width-n)
+	if !color {
+		return fill + empty
+	}
+	return ui.Cyan + fill + ui.Dim + empty + ui.Reset
+}
+
 func maxAgentSwears(rows []analytics.AgentRow) int64 {
 	var max int64
 	for _, row := range rows {
@@ -141,4 +143,11 @@ func maxAgentSwears(rows []analytics.AgentRow) int64 {
 		}
 	}
 	return max
+}
+
+func percent(num, denom int64) float64 {
+	if denom <= 0 {
+		return 0
+	}
+	return float64(num) / float64(denom) * 100
 }

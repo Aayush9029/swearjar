@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -24,6 +25,35 @@ func homePath(parts ...string) string {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func fileSource(agentName, path, session, project string) (Source, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return Source{}, err
+	}
+	return Source{
+		Agent:   agentName,
+		Path:    path,
+		Session: session,
+		Project: project,
+		Size:    info.Size(),
+		ModTime: info.ModTime().UnixNano(),
+	}, nil
+}
+
+func beginSource(ctx context.Context, opts Options, src Source) (bool, error) {
+	if opts.SourceHook == nil {
+		return true, nil
+	}
+	return opts.SourceHook.BeginSource(ctx, src)
+}
+
+func finishSource(ctx context.Context, opts Options, src Source) error {
+	if opts.SourceHook == nil {
+		return nil
+	}
+	return opts.SourceHook.FinishSource(ctx, src)
 }
 
 func validSince(timestamp string, since *time.Time) bool {

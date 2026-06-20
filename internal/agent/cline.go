@@ -14,6 +14,15 @@ func (Cline) VisitMessages(ctx context.Context, opts Options, visit func(Message
 		if err := walkFiles(root, func(path string) bool {
 			return filepath.Base(path) == "api_conversation_history.json"
 		}, func(path string) error {
+			session := filepath.Base(filepath.Dir(path))
+			src, err := fileSource("cline", path, session, "")
+			if err != nil {
+				return nil
+			}
+			read, err := beginSource(ctx, opts, src)
+			if err != nil || !read {
+				return err
+			}
 			var messages []struct {
 				Role    string `json:"role"`
 				Content any    `json:"content"`
@@ -22,7 +31,6 @@ func (Cline) VisitMessages(ctx context.Context, opts Options, visit func(Message
 			if err := readJSONFile(path, &messages); err != nil {
 				return nil
 			}
-			session := filepath.Base(filepath.Dir(path))
 			for _, msg := range messages {
 				select {
 				case <-ctx.Done():
@@ -36,11 +44,11 @@ func (Cline) VisitMessages(ctx context.Context, opts Options, visit func(Message
 				if text == "" || skipInjected(text) || !validSince(msg.TS, opts.Since) {
 					continue
 				}
-				if err := visit(Message{Agent: "cline", Session: session, Timestamp: msg.TS, Text: text}); err != nil {
+				if err := visit(Message{Agent: "cline", Session: session, Timestamp: msg.TS, Text: text, Source: src}); err != nil {
 					return err
 				}
 			}
-			return nil
+			return finishSource(ctx, opts, src)
 		}); err != nil {
 			return err
 		}

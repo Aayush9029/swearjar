@@ -17,7 +17,15 @@ func (Pi) VisitMessages(ctx context.Context, opts Options, visit func(Message) e
 	}, func(path string) error {
 		session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 		project := filepath.Base(filepath.Dir(path))
-		return scanJSONLines(path, func(entry map[string]any) error {
+		src, err := fileSource("pi", path, session, project)
+		if err != nil {
+			return nil
+		}
+		read, err := beginSource(ctx, opts, src)
+		if err != nil || !read {
+			return err
+		}
+		if err := scanJSONLines(path, func(entry map[string]any) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -47,7 +55,11 @@ func (Pi) VisitMessages(ctx context.Context, opts Options, visit func(Message) e
 				Project:   project,
 				Timestamp: timestamp,
 				Text:      text,
+				Source:    src,
 			})
-		})
+		}); err != nil {
+			return err
+		}
+		return finishSource(ctx, opts, src)
 	})
 }
